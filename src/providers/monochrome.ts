@@ -15,10 +15,13 @@ export class MonochromeProvider implements QobuzProvider {
 
   async getStream(trackId: string, _quality: Quality, _atmos: string): Promise<QobuzStream | null> {
     if (!/^[A-Za-z0-9_-]+$/.test(trackId)) return null;
-    return {
-      url: new URL(`/track/${encodeURIComponent(trackId)}`, this.baseUrl()).toString(),
-      format: 'flac', quality: 'LOSSLESS', manifest: 'none', encrypted: false,
-    };
+    const url = new URL(`/track/${encodeURIComponent(trackId)}`, this.baseUrl()).toString();
+    // Monochrome serves a mix of real FLAC and lossy AAC under the same URL
+    // scheme, so inspect the file header instead of assuming FLAC.
+    // Monochrome's first byte can take ~3.5 s on a cold track; stay under
+    // Vercel's 10 s function limit.
+    const detected = await probeCodec(url, 8000);
+    return { url, manifest: 'none', encrypted: false, ...detected };
   }
 
   private baseUrl(): string { return this.config.monochromeBaseUrl ?? 'https://tracks.monochrome.st'; }
@@ -56,8 +59,39 @@ function toTrack(raw: RecordValue): QobuzTrack | null {
   return {
     upstreamId: String(id), title: title.trim(), artist: artists.join(', ') || undefined,
     artworkURL: typeof raw.artwork === 'string' ? raw.artwork : undefined,
-    duration, format: 'flac', audioQuality: 'LOSSLESS',
+    // Format is unknown until the file is fetched; see probeCodec().
+    duration,
   };
+}
+
+type Detected = Pick<QobuzStream, 'format' | 'codec' | 'container' | 'quality'>;
+
+/**
+ * Reads the first bytes of an MP4/FLAC file and reports the real codec.
+ * Never throws: if the probe fails (timeout, 429, odd file) the stream is
+ * returned without a format claim rather than blocking playback.
+ */
+export async function probeCodec(url: string, timeoutMs: number): Promise<Detected> {
+  try {
+    const response = await fetch(url, {
+      headers: { range: 'bytes=0-16383' },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) return {};
+    const head = Buffer.from(await response.arrayBuffer()).toString('latin1');
+    return detectCodec(head);
+  } catch {
+    return {};
+  }
+}
+
+export function detectCodec(head: string): Detected {
+  const container = head.startsWith('fLaC') ? 'flac' : head.includes('ftyp') ? 'mp4' : undefined;
+  if (head.startsWith('fLaC') || head.includes('dfLa') || head.includes('fLaC'))
+    return { format: 'flac', codec: 'flac', container, quality: 'LOSSLESS' };
+  if (head.includes('alac')) return { format: 'alac', codec: 'alac', container, quality: 'LOSSLESS' };
+  if (head.includes('mp4a')) return { format: 'aac', codec: 'aac', container, quality: 'HIGH' };
+  return {};
 }
 
 function isRecord(value: unknown): value is RecordValue { return typeof value === 'object' && value !== null; }
